@@ -3,6 +3,7 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:workmanager/workmanager.dart';
+import 'package:google_fonts/google_fonts.dart';
 
 
 final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
@@ -15,7 +16,7 @@ void callbackDispatcher() {
   Workmanager().executeTask((task, inputData) async {
     try {
       await _initializeNotifications();
-
+      await Future.delayed(const Duration(milliseconds: 500));
       final prefs = await SharedPreferences.getInstance();
 
       // 有効かチェック
@@ -46,6 +47,7 @@ void callbackDispatcher() {
       if (confirmed) {
         // 確認済みの場合、通常の間隔で通知
         if (now.difference(lastNotificationTime).inMinutes >= totalIntervalMinutes) {
+          await prefs.setInt('snoozeCount', 0); // 新しい通知サイクル開始
           await _showNotification(prefs);
         }
       } else {
@@ -55,6 +57,7 @@ void callbackDispatcher() {
           await _showNotification(prefs);
         } else if (lastNotificationTimeMs == 0) {
           // 初回通知
+          await prefs.setInt('snoozeCount', 0);
           await _showNotification(prefs);
         }
       }
@@ -98,32 +101,64 @@ Future<void> _showNotification(SharedPreferences prefs) async {
   final title = prefs.getString('title') ?? 'リマインダー';
   final message = prefs.getString('message') ?? '確認してください';
 
+  // 再通知回数を取得・更新
+  final snoozeCount = prefs.getInt('snoozeCount') ?? 0;
+  final newSnoozeCount = snoozeCount + 1;
+  await prefs.setInt('snoozeCount', newSnoozeCount);
 
-  const androidDetails = AndroidNotificationDetails(
-    'reminder_channel',
-    'リマインダー',
-    channelDescription: '定期的なリマインダー通知',
-    importance: Importance.high,
-    priority: Priority.high,
-    actions: <AndroidNotificationAction>[
-      AndroidNotificationAction(
-        'confirm',
-        '確認',
-        showsUserInterface: true,
-      ),
-    ],
+  // デバッグ情報をログに記録
+  final lastTimeMs = prefs.getInt('lastNotificationTime') ?? 0;
+  final lastTime = lastTimeMs > 0 ? DateTime.fromMillisecondsSinceEpoch(lastTimeMs) : null;
+  final confirmed = prefs.getBool('confirmed') ?? false;
+  final intervalH = prefs.getInt('hours') ?? 0;
+  final intervalM = prefs.getInt('minutes') ?? 0;
+  final snoozeM = prefs.getInt('snooze') ?? 0;
+
+  final now = DateTime.now();
+  final elapsed = lastTime != null ? now.difference(lastTime).inMinutes : 0;
+
+  // ログを追加
+  final logs = prefs.getStringList('logs') ?? [];
+  final logEntry = '${now.hour}:${now.minute.toString().padLeft(2, '0')} - 通知送信 [確認済:${confirmed ? "○" : "×"} 経過:${elapsed}分 設定:${intervalH}h${intervalM}m スヌーズ:${snoozeM}m]';
+  logs.add(logEntry);
+  if (logs.length > 50) logs.removeAt(0); // 最新50件のみ保持
+  await prefs.setStringList('logs', logs);
+
+  // 再通知回数を表示メッセージに追加
+  final displayMessage = snoozeCount > 0
+      ? '$message\n（再通知${snoozeCount}回目）'
+      : message;
+
+  // 通知をタップした時に「confirmed」フラグを立てるペイロードを設定
+  final androidDetails = AndroidNotificationDetails(
+      'reminder_channel',
+      'リマインダー',
+      channelDescription: '定期的なリマインダー通知',
+      importance: Importance.high,
+      priority: Priority.high,
+      autoCancel: true, // タップで消える
+      ongoing: false,
+      // タップした時にアプリを開かない設定
+      actions: <AndroidNotificationAction>[
+        AndroidNotificationAction(
+          'dismiss',
+          '確認',
+          showsUserInterface: false,
+          cancelNotification: true,
+        ),
+      ],
   );
 
 
-  const notificationDetails = NotificationDetails(android: androidDetails);
+  final notificationDetails = NotificationDetails(android: androidDetails);
 
 
   await flutterLocalNotificationsPlugin.show(
-    0,
-    title,
-    message,
-    notificationDetails,
-    payload: 'reminder',
+  0,
+  title,
+  displayMessage,
+  notificationDetails,
+  payload: 'confirm', // ペイロードで確認を伝える
   );
 
 
@@ -148,12 +183,25 @@ void main() async {
   await flutterLocalNotificationsPlugin.initialize(
     initializationSettings,
     onDidReceiveNotificationResponse: (details) async {
-      if (details.actionId == 'confirm') {
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.setBool('confirmed', true);
-        await prefs.setInt('lastNotificationTime', DateTime.now().millisecondsSinceEpoch);
-        await flutterLocalNotificationsPlugin.cancel(0);
+      // ログに記録
+      final prefs = await SharedPreferences.getInstance();
+      final logs = prefs.getStringList('logs') ?? [];
+      final now = DateTime.now();
+
+      // アクションIDを確認
+      if (details.actionId == 'dismiss') {
+      logs.add('${now.hour}:${now.minute.toString().padLeft(2, '0')} - 確認ボタン押下');
+      await prefs.setBool('confirmed', true);
+      await prefs.setInt('lastNotificationTime', DateTime.now().millisecondsSinceEpoch);
+      await prefs.setInt('snoozeCount', 0);
+      await flutterLocalNotificationsPlugin.cancel(0);
+      logs.add('${now.hour}:${now.minute.toString().padLeft(2, '0')} - 確認処理完了');
+      } else {
+      // 通知本体をタップした場合（アプリが開く）
+      logs.add('${now.hour}:${now.minute.toString().padLeft(2, '0')} - 通知タップ');
       }
+
+      await prefs.setStringList('logs', logs);
     },
   );
 
@@ -172,6 +220,9 @@ class MyApp extends StatelessWidget {
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
         useMaterial3: true,
+        textTheme: GoogleFonts.mPlusRounded1cTextTheme(
+          Theme.of(context).textTheme,
+        ),
       ),
       home: const ReminderScreen(),
     );
@@ -198,6 +249,7 @@ class _ReminderScreenState extends State<ReminderScreen> {
   TimeOfDay _startTime = const TimeOfDay(hour: 8, minute: 0);
   TimeOfDay _endTime = const TimeOfDay(hour: 22, minute: 0);
   bool _isEnabled = false;
+  List<String> _logs = [];
 
   @override
   void initState() {
@@ -215,6 +267,7 @@ class _ReminderScreenState extends State<ReminderScreen> {
       _minutesController.text = prefs.getInt('minutes')?.toString() ?? '0';
       _snoozeMinutesController.text = prefs.getInt('snooze')?.toString() ?? '5';
       _isEnabled = prefs.getBool('enabled') ?? false;
+      _logs = prefs.getStringList('logs') ?? [];
 
       int startHour = prefs.getInt('startHour') ?? 8;
       int startMinute = prefs.getInt('startMinute') ?? 0;
@@ -310,186 +363,252 @@ class _ReminderScreenState extends State<ReminderScreen> {
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         title: const Text('リマインダー設定'),
       ),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  children: [
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        const Text(
-                          '動作状態',
-                          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text(
+                            '動作状態',
+                            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                          ),
+                          Switch(
+                            value: _isEnabled,
+                            onChanged: (_) => _toggleEnabled(),
+                          ),
+                        ],
+                      ),
+                      if (_isEnabled)
+                        const Padding(
+                          padding: EdgeInsets.only(top: 8),
+                          child: Text(
+                            '✓ バックグラウンドで動作中',
+                            style: TextStyle(color: Colors.green, fontSize: 12),
+                          ),
                         ),
-                        Switch(
-                          value: _isEnabled,
-                          onChanged: (_) => _toggleEnabled(),
-                        ),
-                      ],
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              const Text('通知内容', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _titleController,
+                decoration: const InputDecoration(
+                  labelText: 'タイトル',
+                  border: OutlineInputBorder(),
+                ),
+                onChanged: (_) => _saveSettings(),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: _messageController,
+                decoration: const InputDecoration(
+                  labelText: 'メッセージ',
+                  border: OutlineInputBorder(),
+                ),
+                maxLines: 3,
+                onChanged: (_) => _saveSettings(),
+              ),
+              const SizedBox(height: 24),
+              const Text('通知間隔', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _hoursController,
+                      decoration: const InputDecoration(
+                        labelText: '時間',
+                        border: OutlineInputBorder(),
+                      ),
+                      keyboardType: TextInputType.number,
+                      onChanged: (_) => _saveSettings(),
                     ),
-                    if (_isEnabled)
-                      const Padding(
-                        padding: EdgeInsets.only(top: 8),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: TextField(
+                      controller: _minutesController,
+                      decoration: const InputDecoration(
+                        labelText: '分',
+                        border: OutlineInputBorder(),
+                      ),
+                      keyboardType: TextInputType.number,
+                      onChanged: (_) => _saveSettings(),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 24),
+              const Text('再通知までの時間', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _snoozeMinutesController,
+                decoration: const InputDecoration(
+                  labelText: '分',
+                  border: OutlineInputBorder(),
+                  helperText: '無視した場合の再通知間隔',
+                ),
+                keyboardType: TextInputType.number,
+                onChanged: (_) => _saveSettings(),
+              ),
+              const SizedBox(height: 24),
+              const Text('通知時間帯', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text('開始時刻'),
+                          TextButton(
+                            onPressed: () async {
+                              final time = await showTimePicker(
+                                context: context,
+                                initialTime: _startTime,
+                              );
+                              if (time != null) {
+                                setState(() {
+                                  _startTime = time;
+                                });
+                                _saveSettings();
+                              }
+                            },
+                            child: Text(
+                              '${_startTime.hour.toString().padLeft(2, '0')}:${_startTime.minute.toString().padLeft(2, '0')}',
+                              style: const TextStyle(fontSize: 18),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const Divider(),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text('終了時刻'),
+                          TextButton(
+                            onPressed: () async {
+                              final time = await showTimePicker(
+                                context: context,
+                                initialTime: _endTime,
+                              );
+                              if (time != null) {
+                                setState(() {
+                                  _endTime = time;
+                                });
+                                _saveSettings();
+                              }
+                            },
+                            child: Text(
+                              '${_endTime.hour.toString().padLeft(2, '0')}:${_endTime.minute.toString().padLeft(2, '0')}',
+                              style: const TextStyle(fontSize: 18),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              Card(
+                color: Colors.blue.shade50,
+                child: const Padding(
+                  padding: EdgeInsets.all(12),
+                  child: Row(
+                    children: [
+                      Icon(Icons.info_outline, color: Colors.blue),
+                      SizedBox(width: 12),
+                      Expanded(
                         child: Text(
-                          '✓ バックグラウンドで動作中',
-                          style: TextStyle(color: Colors.green, fontSize: 12),
+                          'アプリを閉じても通知は継続されます',
+                          style: TextStyle(fontSize: 12),
                         ),
                       ),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 16),
-            const Text('通知内容', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 8),
-            TextField(
-              controller: _titleController,
-              decoration: const InputDecoration(
-                labelText: 'タイトル',
-                border: OutlineInputBorder(),
-              ),
-              onChanged: (_) => _saveSettings(),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _messageController,
-              decoration: const InputDecoration(
-                labelText: 'メッセージ',
-                border: OutlineInputBorder(),
-              ),
-              maxLines: 3,
-              onChanged: (_) => _saveSettings(),
-            ),
-            const SizedBox(height: 24),
-            const Text('通知間隔', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _hoursController,
-                    decoration: const InputDecoration(
-                      labelText: '時間',
-                      border: OutlineInputBorder(),
-                    ),
-                    keyboardType: TextInputType.number,
-                    onChanged: (_) => _saveSettings(),
+                    ],
                   ),
                 ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: TextField(
-                    controller: _minutesController,
-                    decoration: const InputDecoration(
-                      labelText: '分',
-                      border: OutlineInputBorder(),
+              ),
+              const SizedBox(height: 24),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Text('動作ログ', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                  TextButton(
+                    onPressed: () async {
+                      final prefs = await SharedPreferences.getInstance();
+                      await prefs.remove('logs');
+                      setState(() {
+                        _logs = [];
+                      });
+                      if (mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text('ログをクリアしました')),
+                        );
+                      }
+                    },
+                    child: const Text('クリア'),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Card(
+                child: Container(
+                  height: 200,
+                  padding: const EdgeInsets.all(12),
+                  child: _logs.isEmpty
+                      ? const Center(
+                    child: Text(
+                      'ログはまだありません',
+                      style: TextStyle(color: Colors.grey),
                     ),
-                    keyboardType: TextInputType.number,
-                    onChanged: (_) => _saveSettings(),
+                  )
+                      : ListView.builder(
+                    reverse: true,
+                    itemCount: _logs.length,
+                    itemBuilder: (context, index) {
+                      final reversedIndex = _logs.length - 1 - index;
+                      return Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 2),
+                        child: Text(
+                          _logs[reversedIndex],
+                          style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
+                        ),
+                      );
+                    },
                   ),
                 ),
-              ],
-            ),
-            const SizedBox(height: 24),
-            const Text('再通知までの時間', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 8),
-            TextField(
-              controller: _snoozeMinutesController,
-              decoration: const InputDecoration(
-                labelText: '分',
-                border: OutlineInputBorder(),
-                helperText: '無視した場合の再通知間隔',
               ),
-              keyboardType: TextInputType.number,
-              onChanged: (_) => _saveSettings(),
-            ),
-            const SizedBox(height: 24),
-            const Text('通知時間帯', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 8),
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  children: [
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        const Text('開始時刻'),
-                        TextButton(
-                          onPressed: () async {
-                            final time = await showTimePicker(
-                              context: context,
-                              initialTime: _startTime,
-                            );
-                            if (time != null) {
-                              setState(() {
-                                _startTime = time;
-                              });
-                              _saveSettings();
-                            }
-                          },
-                          child: Text(
-                            '${_startTime.hour.toString().padLeft(2, '0')}:${_startTime.minute.toString().padLeft(2, '0')}',
-                            style: const TextStyle(fontSize: 18),
-                          ),
-                        ),
-                      ],
-                    ),
-                    const Divider(),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        const Text('終了時刻'),
-                        TextButton(
-                          onPressed: () async {
-                            final time = await showTimePicker(
-                              context: context,
-                              initialTime: _endTime,
-                            );
-                            if (time != null) {
-                              setState(() {
-                                _endTime = time;
-                              });
-                              _saveSettings();
-                            }
-                          },
-                          child: Text(
-                            '${_endTime.hour.toString().padLeft(2, '0')}:${_endTime.minute.toString().padLeft(2, '0')}',
-                            style: const TextStyle(fontSize: 18),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
+              const SizedBox(height: 8),
+              TextButton.icon(
+                onPressed: () async {
+                  await _loadSettings();
+                  if (mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('ログを更新しました')),
+                    );
+                  }
+                },
+                icon: const Icon(Icons.refresh, size: 16),
+                label: const Text('ログを更新'),
               ),
-            ),
-            const SizedBox(height: 16),
-            Card(
-              color: Colors.blue.shade50,
-              child: const Padding(
-                padding: EdgeInsets.all(12),
-                child: Row(
-                  children: [
-                    Icon(Icons.info_outline, color: Colors.blue),
-                    SizedBox(width: 12),
-                    Expanded(
-                      child: Text(
-                        'アプリを閉じても通知は継続されます',
-                        style: TextStyle(fontSize: 12),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ],
+              const SizedBox(height: 16), // 下部に余白追加
+            ],
+          ),
         ),
       ),
     );
